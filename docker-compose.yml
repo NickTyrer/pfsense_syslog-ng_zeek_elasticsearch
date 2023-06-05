@@ -1,0 +1,183 @@
+version: '3.9'
+services:
+##################################################################################################################################################################################################################################################################################
+  elastic_setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: elastic_setup
+    security_opt:
+      - no-new-privileges:true
+    user: "0"
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: elastic\n"\
+          "    dns:\n"\
+          "      - elastic\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: kibana\n"\
+          "    dns:\n"\
+          "      - kibana\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions"
+        chown -R root:root config/certs;
+        find . -type d -exec chmod 750 \{\} \;;
+        find . -type f -exec chmod 640 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://elastic:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://elastic:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+      '
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    networks:
+      - elastic_net
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/elastic/elastic.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+##################################################################################################################################################################################################################################################################################
+  elastic:
+    depends_on:
+      elastic_setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: elastic
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - bootstrap.memory_lock=true
+      - discovery.type=single-node
+      - node.name=elastic
+      - xpack.license.self_generated.type=basic
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/elastic/elastic.key
+      - xpack.security.http.ssl.certificate=certs/elastic/elastic.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - ES_JAVA_OPTS=-Xms5g -Xmx5g
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - elastic_data:/usr/share/elasticsearch/data
+    networks:
+      - elastic_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+##################################################################################################################################################################################################################################################################################
+  kibana:
+    depends_on:
+      elastic:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    container_name: kibana
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - ELASTICSEARCH_HOSTS=https://elastic:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+      - SERVERNAME=kibana
+      - SERVER_SSL_ENABLED=true
+      - SERVER_SSL_KEY=config/certs/kibana/kibana.key
+      - SERVER_SSL_CERTIFICATE=config/certs/kibana/kibana.crt
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY}
+      - XPACK_ENCRYPTEDREPORTING_ENCRYPTIONKEY=${XPACK_ENCRYPTEDREPORTING_ENCRYPTIONKEY}
+      - XPACK_ENCRYPTEDSECURITY_ENCRYPTIONKEY=${XPACK_ENCRYPTEDSECURITY_ENCRYPTIONKEY}
+    volumes:
+      - certs:/usr/share/kibana/config/certs
+      - kibana_data:/usr/share/kibana/data
+    networks:
+      - elastic_net
+    ports:
+      - '192.168.1.7:5601:5601/tcp'
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -I --cacert config/certs/ca/ca.crt https://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+##################################################################################################################################################################################################################################################################################
+  filebeat:
+    depends_on:
+      elastic:
+        condition: service_healthy
+      kibana:
+        condition: service_healthy
+    image: docker.elastic.co/beats/filebeat:${STACK_VERSION}
+    container_name: filebeat
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+    volumes:
+      - ./filebeat_config/filebeat.yml:/usr/share/filebeat/filebeat.yml
+      - ./filebeat_config/zeek.yml:/usr/share/filebeat/modules.d/zeek.yml
+      - ./zeek_logs:/zeek_logs
+      - certs:/usr/share/filebeat/config/certs
+    networks:
+      - elastic_net
+##################################################################################################################################################################################################################################################################################
+  syslog-ng-server:
+    depends_on:
+      - filebeat
+    image: lscr.io/linuxserver/syslog-ng:latest
+    container_name: syslog-ng-server
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=GB
+    volumes:
+      - ./syslog-ng_config/syslog-ng.conf:/config/syslog-ng.conf
+      - ./syslog-ng_config/certs:/config/certs
+      - ./zeek_logs:/zeek_logs
+    networks:
+      - elastic_net
+    ports:
+      - '601:601/tcp'
+##################################################################################################################################################################################################################################################################################
+#created beforehand using [docker network create elastic_net --subnet 10.10.30.0/24]
+networks:
+  elastic_net:
+    external: true
+
+volumes:
+  certs:
+  elastic_data:
+  kibana_data:
