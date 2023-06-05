@@ -1,0 +1,19 @@
+filebeat.config:
+  modules:
+    path: ${path.config}/modules.d/*.yml
+    reload.enabled: false
+
+processors:
+  - add_cloud_metadata: ~
+  - add_docker_metadata: ~
+
+output.elasticsearch:
+  hosts: "https://elastic:9200"
+  username: "elastic"
+  password: '${ELASTICSEARCH_PASSWORD}'
+  ssl.certificate_authorities: ["config/certs/ca/ca.crt"]
+
+setup.kibana:
+    host: "https://kibana:5601"
+    ssl.enabled: true
+    ssl.certificate_authorities: ["config/certs/ca/ca.crt"]
